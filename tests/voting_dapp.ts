@@ -3,89 +3,156 @@ import { Program } from "@coral-xyz/anchor";
 import { VotingDapp } from "../target/types/voting_dapp";
 import { assert } from "chai";
 
-describe("voting_dapp", () => {
-  // Configure the client to use the local cluster
+describe("voting_dapp with deadline", () => {
   const provider = anchor.AnchorProvider.local();
   anchor.setProvider(provider);
-
   const program = anchor.workspace.VotingDapp as Program<VotingDapp>;
 
-  it("Can create a proposal", async () => {
+  function deriveVotePda(
+    proposal: anchor.web3.PublicKey,
+    voter: anchor.web3.PublicKey
+  ) {
+    return anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("vote"), proposal.toBuffer(), voter.toBuffer()],
+      program.programId
+    )[0];
+  }
+
+  async function sleep(ms: number) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  it("Creates proposal with deadline", async () => {
     const proposal = anchor.web3.Keypair.generate();
+    const duration = 10; // 10 sec
 
     await program.methods
-      .createProposal("Should we build a new feature?")
+      .createProposal("Deadline test base", new anchor.BN(duration))
       .accounts({
         proposal: proposal.publicKey,
         creator: provider.wallet.publicKey,
-        systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([proposal])
       .rpc();
 
-    const proposalAccount = await program.account.proposal.fetch(
-      proposal.publicKey
-    );
-
-    assert.equal(
-      proposalAccount.description,
-      "Should we build a new feature?"
-    );
-    assert.equal(proposalAccount.votesYes.toNumber(), 0);
-    assert.equal(proposalAccount.votesNo.toNumber(), 0);
-    assert.equal(proposalAccount.isActive, true);
+    const acc: any = await program.account.proposal.fetch(proposal.publicKey);
+    assert.equal(acc.description, "Deadline test base");
+    assert.isTrue(acc.isActive);
+    assert.isAbove(acc.endTs.toNumber(), acc.startTs.toNumber());
   });
 
-  it("Can vote yes on a proposal", async () => {
+  it("Allows voting before deadline", async () => {
     const proposal = anchor.web3.Keypair.generate();
-    const vote = anchor.web3.Keypair.generate();
+    const duration = 5;
 
-    // First create the proposal
     await program.methods
-      .createProposal("Fund project X?")
+      .createProposal("Vote before deadline", new anchor.BN(duration))
       .accounts({
         proposal: proposal.publicKey,
         creator: provider.wallet.publicKey,
-        systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([proposal])
       .rpc();
 
-    // Then cast a YES vote
+    const votePda = deriveVotePda(
+      proposal.publicKey,
+      provider.wallet.publicKey
+    );
+
     await program.methods
       .vote(true)
-      .accounts({
+      .accountsStrict({
         proposal: proposal.publicKey,
-        vote: vote.publicKey,
+        vote: votePda,
         voter: provider.wallet.publicKey,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
-      .signers([vote])
       .rpc();
 
-    const proposalAccount = await program.account.proposal.fetch(
-      proposal.publicKey
-    );
-
-    assert.equal(proposalAccount.votesYes.toNumber(), 1);
-    assert.equal(proposalAccount.votesNo.toNumber(), 0);
+    const acc: any = await program.account.proposal.fetch(proposal.publicKey);
+    assert.equal(acc.votesYes.toNumber(), 1);
+    assert.equal(acc.votesNo.toNumber(), 0);
   });
 
-  it("Can close a proposal", async () => {
+  it("Prevents vote after deadline", async () => {
     const proposal = anchor.web3.Keypair.generate();
+    const duration = 1; // 1 sec
 
-    // Create proposal
     await program.methods
-      .createProposal("Close test proposal")
+      .createProposal("Expire fast", new anchor.BN(duration))
       .accounts({
         proposal: proposal.publicKey,
         creator: provider.wallet.publicKey,
-        systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([proposal])
       .rpc();
 
-    // Close it
+    await sleep(1500);
+
+    const votePda = deriveVotePda(
+      proposal.publicKey,
+      provider.wallet.publicKey
+    );
+    let failed = false;
+    try {
+      await program.methods
+        .vote(true)
+        .accountsStrict({
+          proposal: proposal.publicKey,
+          vote: votePda,
+          voter: provider.wallet.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "Vote should fail after deadline");
+  });
+
+  it("Cannot close before deadline", async () => {
+    const proposal = anchor.web3.Keypair.generate();
+    const duration = 3;
+
+    await program.methods
+      .createProposal("Early close attempt", new anchor.BN(duration))
+      .accounts({
+        proposal: proposal.publicKey,
+        creator: provider.wallet.publicKey,
+      })
+      .signers([proposal])
+      .rpc();
+
+    let failed = false;
+    try {
+      await program.methods
+        .closeProposal()
+        .accounts({
+          proposal: proposal.publicKey,
+          creator: provider.wallet.publicKey,
+        })
+        .rpc();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "Should not close before deadline");
+  });
+
+  it("Can close after deadline passes", async () => {
+    const proposal = anchor.web3.Keypair.generate();
+    const duration = 1;
+
+    await program.methods
+      .createProposal("Close after expiry", new anchor.BN(duration))
+      .accounts({
+        proposal: proposal.publicKey,
+        creator: provider.wallet.publicKey,
+      })
+      .signers([proposal])
+      .rpc();
+
+    await sleep(1500);
+
     await program.methods
       .closeProposal()
       .accounts({
@@ -94,10 +161,25 @@ describe("voting_dapp", () => {
       })
       .rpc();
 
-    const proposalAccount = await program.account.proposal.fetch(
-      proposal.publicKey
-    );
+    const acc: any = await program.account.proposal.fetch(proposal.publicKey);
+    assert.isFalse(acc.isActive);
+  });
 
-    assert.equal(proposalAccount.isActive, false);
+  it("Rejects invalid duration", async () => {
+    const proposal = anchor.web3.Keypair.generate();
+    let failed = false;
+    try {
+      await program.methods
+        .createProposal("Invalid duration", new anchor.BN(0))
+        .accounts({
+          proposal: proposal.publicKey,
+          creator: provider.wallet.publicKey,
+        })
+        .signers([proposal])
+        .rpc();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "Should fail on duration 0");
   });
 });
