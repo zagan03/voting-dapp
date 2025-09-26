@@ -26,7 +26,7 @@ pub struct ProposalClosed {
 
 const MAX_DESCRIPTION_LEN: usize = 200;
 
-declare_id!("AjRPUV96mR92DZMDGTrQmLBrNxbjXwn6mmQbMgyGPqAw"); // update if redeployed
+declare_id!("FotkyW5saNF7jWoJXZm4yDcEabcCkUnZPB2RQa7hJJZr"); // update if redeployed
 #[program]
 pub mod voting_dapp {
     use super::*;
